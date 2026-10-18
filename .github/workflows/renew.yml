@@ -2,11 +2,11 @@ name: Auto Renew HYEHOST
 
 on:
   workflow_dispatch:
-  schedule:
+  #schedule:
     # 免费主机每 30 天需确认续期一次；默认每月 17 日运行(原到期日)
     # cron 为 UTC 时间，北京时间 = UTC+8，例如 09:00 UTC = 北京时间 17:00
     # 根据你的到期日修改：服务 17 号到期 -> '0 9 17 * *'
-    - cron: '0 9 17 * *'
+   # - cron: '0 9 17 * *'
 
 # 防止同一时间运行多个任务导致 push 冲突
 concurrency:

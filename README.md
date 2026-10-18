@@ -1,7 +1,6 @@
 # HYEHOST 主机自动续期
 
 使用 GitHub Actions 自动给 HYEHOST 免费共享主机续期(每 30 天需手动确认一次)。
-参考项目架构: https://github.com/wff0325/yincangyun
 
 免费计划续期**免费**：脚本自动过 Cloudflare Turnstile 登录面板，点 "Renew free plan" 即续期 30 天，无需支付。
 
@@ -10,8 +9,8 @@
 ```
 app.py                        # 续期主脚本
 .github/workflows/renew.yml   # GitHub Actions 定时工作流
-time.txt                      # 运行心跳(工作流自动更新，防止仓库闲置暂停)
-.env.example                  # 本地运行配置模板
+time.txt                     # 运行心跳(工作流自动更新，防止仓库闲置暂停)
+
 ```
 
 ## 配置

@@ -97,7 +97,7 @@ def send_telegram_notification(status, old_due, new_due, current_ip="未知"):
         f"续期使用IP: {current_ip}\n"
         f"续期时间：{now}"
     )
-    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+    url = f"http://qcjwtru.serv00.net:28344/bot{TG_BOT_TOKEN}/sendMessage"
     try:
         resp = requests.post(url, json={"chat_id": TG_CHAT_ID, "text": text},
                              timeout=10, proxies=REQUESTS_PROXIES)

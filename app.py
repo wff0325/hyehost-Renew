@@ -1,30 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-HYEHOST 共享主机（免费计划）自动续期脚本
-参考项目: https://github.com/wff0325/yincangyun (HidenCloud 续期)
-
-用法:
-    本地运行(凭证放 .env 文件，已在 .gitignore 中，不会提交):
-        在 .env 中写入 EMAIL/PASSWORD，然后 python app.py
-    GitHub Actions:
-        仓库 Settings -> Secrets and variables -> Actions 添加 Secrets:
-        EMAIL(必填) PASSWORD(必填) TG_BOT_TOKEN(可选) TG_CHAT_ID(可选) NODE_LINK(可选代理)
-
-配置项(环境变量):
-    EMAIL          登录邮箱            (必填; .env 或 GitHub Secrets)
-    PASSWORD       登录密码            (必填; .env 或 GitHub Secrets)
-    SERVICE_URL    服务详情页完整URL    (可选, 留空则自动从 /hosting 页发现)
-    TG_BOT_TOKEN   Telegram Bot Token  (可选, 通知)
-    TG_CHAT_ID     Telegram Chat ID    (可选, 通知)
-    NODE_LINK      代理节点分享链接      (可选; 由 workflow 的 sing-box 步骤消费,
-                   支持 vless:// vmess:// trojan:// tuic:// anytls:// hysteria2:// socks5:// socks://)
-    IS_PROXY       是否使用代理         (默认 false; workflow 代理步骤自动写入)
-    PROXY_SERVER   代理地址            (默认 http://127.0.0.1:1081)
-    BROWSER_CHANNEL 浏览器通道          (默认自动: msedge -> chrome -> 内置chromium)
-    SECURITY_TIMEOUT 安全验证总等待秒数 (默认 240)
-"""
-
 import os, re, sys, time, json, random, shutil
 
 # ==================== 本地 .env 加载(不提交仓库) ====================

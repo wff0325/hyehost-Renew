@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
+
 import os, re, sys, time, json, random, shutil
 
 # ==================== 本地 .env 加载(不提交仓库) ====================
@@ -30,7 +32,7 @@ SERVICE_URL     = os.environ.get('SERVICE_URL') or ""          # 例: https://pa
 TG_BOT_TOKEN    = os.environ.get('TG_BOT_TOKEN') or ""
 TG_CHAT_ID      = os.environ.get('TG_CHAT_ID') or ""
 IS_PROXY        = os.environ.get('IS_PROXY', 'false').lower() == 'true'
-PROXY_SERVER    = os.environ.get('PROXY_SERVER') or "http://127.0.0.1:1081"
+PROXY_SERVER    = (os.environ.get('PROXY_SERVER') or "http://127.0.0.1:1081").strip()
 BROWSER_CHANNEL = os.environ.get('BROWSER_CHANNEL') or ""     # 空=自动探测
 SECURITY_TIMEOUT = int(os.environ.get('SECURITY_TIMEOUT') or "240")
 
@@ -56,13 +58,17 @@ SECURITY_TITLE_HINTS = ('security verification', 'just a moment', 'attention req
 DEFAULT_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
 # 续期成功提示 (toast): "Free hosting renewed for another 30 days." / "Free bot renewed for another 30 days."
 RENEW_SUCCESS_RE = re.compile(r'renewed\s+(for another|successfully)', re.IGNORECASE)
-# 到期时间匹配(兼容多格式):
-#   "Renewal due: 17/11/2026" (DD/MM/YYYY, 共享主机)
-#   "Current renewal date: 2026年11月23日" (中文, Bot Hosting)
-#   "2026-11-23" (兜底)
+# 到期时间匹配(兼容多格式, 中英文界面/多种日期写法):
+#   "Renewal due: 17/11/2026"          (共享主机, DD/MM/YYYY)
+#   "Current renewal date: 23/11/2026" (Bot Hosting 英文界面)
+#   "Current renewal date: 2026年11月23日" (Bot Hosting 中文界面)
+#   "November 23, 2026" / "2026-11-23"
 DUE_DATE_RES = [
-    re.compile(r'(?:Renewal due|Due)\s*:?\s*(\d{1,2}/\d{1,2}/\d{4})', re.IGNORECASE),
+    re.compile(r'(?:Renewal due|Due|renewal date|expiry)\s*:?\s*(\d{1,2}/\d{1,2}/\d{4})', re.IGNORECASE),
     re.compile(r'(?:renewal date|expiry|due)\s*:?\s*(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日', re.IGNORECASE),
+    re.compile(r'(?:renewal date|expiry|due)\s*:?\s*(\d{4}-\d{2}-\d{2})', re.IGNORECASE),
+    re.compile(r'(?:renewal date|expiry|due)\s*:?\s*([A-Z][a-z]+ \d{1,2}, \d{4})', re.IGNORECASE),
+    re.compile(r'(\d{1,2}/\d{1,2}/\d{4})'),
     re.compile(r'(\d{4}-\d{2}-\d{2})'),
 ]
 
@@ -84,7 +90,7 @@ def get_current_ip(proxy_server=None):
     """获取当前出口IP"""
     proxies = {"http": proxy_server, "https": proxy_server} if (proxy_server and IS_PROXY) else None
     try:
-        resp = requests.get("https://.ip.sb/ip", proxies=proxies, timeout=15)
+        resp = requests.get("https://api.ip.sb/ip", proxies=proxies, timeout=15)
         if resp.status_code == 200:
             return resp.text.strip()
         return "获取失败"
@@ -589,6 +595,17 @@ def main():
 
             browser, page = open_browser(p)
             page.set_default_timeout(15000)
+
+            if current_ip == "获取失败":
+                # requests 走 socks5 代理可能失败(PySocks/代理串问题), 用浏览器兜底取出口IP
+                try:
+                    page.goto("https://api.ip.sb/ip", wait_until="domcontentloaded", timeout=20000)
+                    ip_text = page.locator("body").inner_text().strip()
+                    if ip_text and len(ip_text) < 50:
+                        current_ip = ip_text
+                        log(f"当前出口IP(浏览器获取): {current_ip}")
+                except Exception:
+                    pass
 
             if not login(page):
                 sys.exit(1)

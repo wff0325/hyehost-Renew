@@ -1,5 +1,34 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+HYEHOST 共享主机/Bot Hosting(免费计划)自动续期脚本
+参考项目: https://github.com/wff0325/yincangyun (HidenCloud 续期)
+
+支持多服务类型自动续期: 登录后自动发现 Shared Hosting(/hosting) 和
+Bot Hosting(/bots) 下的所有服务, 逐个读取到期时间并续期。
+新增服务类型只需在 SERVICE_TYPES 列表加一项(列表页路径/链接正则/续期按钮文本)。
+
+用法:
+    本地运行(凭证放 .env 文件，已在 .gitignore 中，不会提交):
+        在 .env 中写入 EMAIL/PASSWORD，然后 python app.py
+    GitHub Actions:
+        仓库 Settings -> Secrets and variables -> Actions 添加 Secrets:
+        EMAIL(必填) PASSWORD(必填) TG_BOT_TOKEN(可选) TG_CHAT_ID(可选) NODE_LINK(可选代理)
+
+配置项(环境变量):
+    EMAIL          登录邮箱            (必填; .env 或 GitHub Secrets)
+    PASSWORD       登录密码            (必填; .env 或 GitHub Secrets)
+    SERVICE_URL    服务详情页完整URL    (可选, 留空则自动发现所有类型的所有服务)
+    TG_BOT_TOKEN   Telegram Bot Token  (可选, 通知)
+    TG_CHAT_ID     Telegram Chat ID    (可选, 通知)
+    NODE_LINK      代理节点分享链接      (可选; 由 workflow 的 sing-box 步骤消费,
+                   支持 vless:// vmess:// trojan:// tuic:// anytls:// hysteria2:// socks5:// socks://)
+    IS_PROXY       是否使用代理         (默认 false; workflow 代理步骤自动写入)
+    PROXY_SERVER   代理地址            (默认 http://127.0.0.1:1081)
+    BROWSER_CHANNEL 浏览器通道          (默认自动: msedge -> chrome -> 内置chromium)
+    SECURITY_TIMEOUT 安全验证总等待秒数 (默认 240)
+"""
+
 import os, re, sys, time, json, random, shutil
 
 # ==================== 本地 .env 加载(不提交仓库) ====================
@@ -54,10 +83,26 @@ CF_IFRAME_SELECTOR = 'iframe[src*="challenges.cloudflare.com"]'
 SECURITY_TITLE_HINTS = ('security verification', 'just a moment', 'attention required',
                         'checking your browser', 'one more step')
 DEFAULT_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
-# 续期成功提示 (toast): "Free hosting renewed for another 30 days."
+# 续期成功提示 (toast): "Free hosting renewed for another 30 days." / "Free bot renewed for another 30 days."
 RENEW_SUCCESS_RE = re.compile(r'renewed\s+(for another|successfully)', re.IGNORECASE)
-# "Renewal due: 17/11/2026" / "Due 17/11/2026" (DD/MM/YYYY)
-DUE_DATE_RE = re.compile(r'(?:Renewal due|Due)[\s:]*(\d{1,2}/\d{1,2}/\d{4})', re.IGNORECASE)
+# 到期时间匹配(兼容多格式):
+#   "Renewal due: 17/11/2026" (DD/MM/YYYY, 共享主机)
+#   "Current renewal date: 2026年11月23日" (中文, Bot Hosting)
+#   "2026-11-23" (兜底)
+DUE_DATE_RES = [
+    re.compile(r'(?:Renewal due|Due)\s*:?\s*(\d{1,2}/\d{1,2}/\d{4})', re.IGNORECASE),
+    re.compile(r'(?:renewal date|expiry|due)\s*:?\s*(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日', re.IGNORECASE),
+    re.compile(r'(\d{4}-\d{2}-\d{2})'),
+]
+
+def _parse_due(text):
+    for i, rx in enumerate(DUE_DATE_RES):
+        m = rx.search(text)
+        if m:
+            if i == 1:
+                return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+            return m.group(1).strip()
+    return None
 
 def log(message):
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}", flush=True)
@@ -76,11 +121,11 @@ def get_current_ip(proxy_server=None):
         log(f"获取出口IP失败: {e}")
         return "获取失败"
 
-def send_telegram_notification(status, old_due, new_due, current_ip="未知"):
-    """发送 Telegram 通知"""
+def send_telegram_notification(summary, current_ip="未知"):
+    """发送 Telegram 通知(汇总多服务续期结果)"""
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         log("Telegram 未配置，跳过通知")
-        return False
+        return
     local_time = time.gmtime(time.time() + 8 * 3600)
     now = time.strftime("%Y-%m-%d %H:%M:%S", local_time)
     if '@' in EMAIL:
@@ -90,14 +135,12 @@ def send_telegram_notification(status, old_due, new_due, current_ip="未知"):
         masked = EMAIL[:2] + '****'
     text = (
         f"HYEHOST 续期通知\n\n"
-        f"{status}\n"
+        f"{summary}\n"
         f"账号: {masked}\n"
-        f"续期前到期：{old_due}\n"
-        f"续期后到期：{new_due}\n"
         f"续期使用IP: {current_ip}\n"
         f"续期时间：{now}"
     )
-    url = f"http://qcjwtru.serv00.net:28344/bot{TG_BOT_TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     try:
         resp = requests.post(url, json={"chat_id": TG_CHAT_ID, "text": text},
                              timeout=10, proxies=REQUESTS_PROXIES)
@@ -107,7 +150,6 @@ def send_telegram_notification(status, old_due, new_due, current_ip="未知"):
         log(f"Telegram 通知失败: {resp.text}")
     except Exception as e:
         log(f"Telegram 通知异常: {e}")
-    return False
 
 def _get_turnstile_token(page):
     """读取 Turnstile token，未通过时返回 None"""
@@ -409,84 +451,124 @@ def _is_logged_in(page):
     except Exception:
         return False
 
-# ==================== 服务发现 ====================
-def get_service_url(page):
-    """自动从 /hosting 页面发现服务详情页 URL"""
-    try:
-        if HOSTING_URL not in page.url:
-            page.goto(HOSTING_URL, wait_until="domcontentloaded", timeout=60000)
+# ==================== 服务类型定义(新增服务类型只需在此加一项) ====================
+SERVICE_TYPES = [
+    {
+        "name": "Shared Hosting",
+        "list_path": "/hosting",
+        "link_re": r"^/hosting/([A-Za-z0-9_-]{6,})$",
+        "renew_texts": ["Renew free plan"],
+    },
+    {
+        "name": "Bot Hosting",
+        "list_path": "/bots",
+        "link_re": r"^/bots/([A-Za-z0-9_-]{6,})$",
+        "renew_texts": ["Renew for 30 days"],
+    },
+]
+
+def discover_services(page):
+    """遍历 SERVICE_TYPES 列表页, 返回 [{"type": 类型名, "url": 服务页URL}]"""
+    services = []
+    seen = set()
+    for st in SERVICE_TYPES:
+        try:
+            page.goto(BASE_URL + st["list_path"], wait_until="domcontentloaded", timeout=60000)
             handle_cloudflare(page)
             time.sleep(2)
-        links = page.evaluate(
-            "() => Array.from(document.querySelectorAll('a[href]')).map(a => a.getAttribute('href'))"
-        )
-        for href in links:
-            if not href:
-                continue
-            m = re.match(rf'^{re.escape(BASE_URL)}/hosting/([A-Za-z0-9_-]{{6,}})$', href)
-            if m and m.group(1).lower() not in ('order',):
-                url = f"{BASE_URL}/hosting/{m.group(1)}"
-                log(f"发现服务: {url}")
-                return url
-            m2 = re.match(r'^/hosting/([A-Za-z0-9_-]{6,})$', href)
-            if m2 and m2.group(1).lower() not in ('order',):
-                url = f"{BASE_URL}/hosting/{m2.group(1)}"
-                log(f"发现服务: {url}")
-                return url
-        log("未在 /hosting 页面找到服务链接")
-    except Exception as e:
-        log(f"获取服务链接异常: {e}")
-    return None
+            links = page.evaluate(
+                "() => Array.from(document.querySelectorAll('a[href]')).map(a => a.getAttribute('href'))"
+            )
+            found = 0
+            for href in links:
+                if not href:
+                    continue
+                if re.match(st["link_re"], href) and href not in seen:
+                    seen.add(href)
+                    url = href if href.startswith("http") else BASE_URL + href
+                    services.append({"type": st["name"], "url": url})
+                    found += 1
+            log(f"{st['name']}: 发现 {found} 个服务")
+        except Exception as e:
+            log(f"获取 {st['name']} 服务列表异常: {e}")
+    return services
 
 # ==================== 到期时间 ====================
-def get_due_date(page, service_url):
-    """读取服务页的到期时间 (Renewal due: DD/MM/YYYY)"""
+def get_due_date(page):
+    """读取当前服务页的到期时间(自动兼容 DD/MM/YYYY、YYYY年M月D日、YYYY-MM-DD)"""
     try:
-        if page.url != service_url:
-            page.goto(service_url, wait_until="domcontentloaded", timeout=60000)
-            handle_cloudflare(page)
-            time.sleep(2)
-        body_text = page.locator("body").inner_text()
-        m = DUE_DATE_RE.search(body_text)
-        if m:
-            due = m.group(1).strip()
-            log(f"当前到期时间: {due}")
+        text = page.locator("body").inner_text()
+        due = _parse_due(text)
+        if due:
             return due
-        log("未匹配到到期时间")
     except Exception as e:
-        log(f"获取到期时间异常: {e}")
+        log(f"读取到期时间异常: {e}")
     return "未知"
 
+def _read_due_with_retry(page, url, old_due, retries=6):
+    """续期后轮询读取新到期时间(hyehost 面板有后台同步延迟, 读不到就返回旧值)"""
+    new_due = old_due
+    for i in range(retries):
+        try:
+            page.reload(wait_until="domcontentloaded", timeout=60000)
+            handle_cloudflare(page)
+            time.sleep(3)
+        except Exception:
+            pass
+        new_due = get_due_date(page)
+        if new_due != old_due:
+            break
+        if i < retries - 1:
+            log("到期时间尚未刷新，5 秒后重试...")
+            time.sleep(5)
+    return new_due
+
 # ==================== 续期 ====================
-def renew_service(page, service_url):
-    """执行续期，返回 True(成功) / False(失败) / 'NOT_TIME'(未到续期时间)"""
+def _find_renew_button(page, svc):
+    """按服务类型精确匹配续期按钮文本, 最后才用通用 'Renew' 兜底"""
+    texts = []
+    for st in SERVICE_TYPES:
+        if st["name"] == svc.get("type"):
+            texts = list(st.get("renew_texts", []))
+    texts.append("Renew")
+    for t in texts:
+        loc = page.locator(f'button:has-text("{t}")')
+        if loc.count() > 0:
+            return loc.first
+    return None
+
+def renew_service(page, svc):
+    """执行单个服务续期, 返回 (结果, 旧到期, 新到期)
+    结果: True成功 / False失败 / 'NOT_TIME'未到续期时间"""
+    url = svc["url"]
+    stype = svc["type"]
+    tag = stype.replace(" ", "_")
     try:
-        log("进入续期流程...")
-        if page.url != service_url:
-            page.goto(service_url, wait_until="domcontentloaded", timeout=60000)
+        log(f"[{stype}] 进入续期流程...")
+        if page.url != url:
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
             handle_cloudflare(page)
             time.sleep(2)
 
-        renew_btn = page.locator('button:has-text("Renew free plan")')
-        if renew_btn.count() == 0:
-            renew_btn = page.locator('button:has-text("Renew")')
-        if renew_btn.count() == 0:
-            log("未找到续期按钮")
-            page.screenshot(path="renew_no_button.png")
-            return "NOT_TIME"
+        old_due = get_due_date(page)
+        log(f"[{stype}] 续期前到期: {old_due}")
 
-        btn = renew_btn.first
+        btn = _find_renew_button(page, svc)
+        if btn is None:
+            log(f"[{stype}] 未找到续期按钮")
+            page.screenshot(path=f"renew_no_button_{tag}.png")
+            return False, old_due, old_due
         try:
             if btn.is_disabled():
-                log("续期按钮不可用（可能 30 天内已续期过）")
-                return "NOT_TIME"
+                log(f"[{stype}] 续期按钮不可用（可能 30 天内已续期过）")
+                return "NOT_TIME", old_due, old_due
         except Exception:
             pass
         btn.scroll_into_view_if_needed()
-        log("点击续期按钮...")
+        log(f"[{stype}] 点击续期按钮...")
         btn.click(timeout=10000)
 
-        # 等待结果：成功提示 / 错误提示
+        # 等待结果: 成功提示 / 未到续期时间提示
         start = time.time()
         last_text = ""
         while time.time() - start < 45:
@@ -496,27 +578,28 @@ def renew_service(page, service_url):
                 text = page.locator("body").inner_text()
                 last_text = text
                 if RENEW_SUCCESS_RE.search(text):
-                    log("续期成功: " + RENEW_SUCCESS_RE.search(text).group(0))
+                    log(f"[{stype}] 续期成功: " + RENEW_SUCCESS_RE.search(text).group(0))
                     time.sleep(2)
-                    return True
+                    new_due = _read_due_with_retry(page, url, old_due)
+                    return True, old_due, new_due
                 m = re.search(r'(only renew[^.\n]*|already renewed[^.\n]*)', text, re.IGNORECASE)
                 if m:
-                    log(f"未到续期时间: {m.group(1)}")
-                    page.screenshot(path="renew_not_allowed.png")
-                    return "NOT_TIME"
+                    log(f"[{stype}] 未到续期时间: {m.group(1)}")
+                    page.screenshot(path=f"renew_not_allowed_{tag}.png")
+                    return "NOT_TIME", old_due, old_due
             except Exception:
                 pass
             time.sleep(1)
-        log(f"未检测到续期结果，页面文本末尾 300 字: {last_text[-300:]}")
-        page.screenshot(path="renew_no_result.png")
-        return False
+        log(f"[{stype}] 未检测到续期结果，页面文本末尾 300 字: {last_text[-300:]}")
+        page.screenshot(path=f"renew_no_result_{tag}.png")
+        return False, old_due, old_due
     except Exception as e:
-        log(f"续期异常: {e}")
+        log(f"[{stype}] 续期异常: {e}")
         try:
-            page.screenshot(path="renew_error.png")
+            page.screenshot(path=f"renew_error_{tag}.png")
         except Exception:
             pass
-        return False
+        return False, "未知", "未知"
 
 # ==================== 主流程 ====================
 def main():
@@ -525,7 +608,6 @@ def main():
         log("缺少登录凭证，退出")
         sys.exit(1)
 
-    service_url = SERVICE_URL
     with sync_playwright() as p:
         browser = None
         try:
@@ -540,48 +622,40 @@ def main():
             if not login(page):
                 sys.exit(1)
 
-            if not service_url:
-                service_url = get_service_url(page)
-                if not service_url:
-                    log("无法获取服务地址，退出")
-                    sys.exit(1)
-
-            old_due = get_due_date(page, service_url)
-            log(f"续期前到期时间: {old_due}")
-
-            renew_result = renew_service(page, service_url)
-
-            new_due = old_due
-            if renew_result == "NOT_TIME":
-                log("未到续期时间，目前无法续期")
-                status = "未到续期时间"
-            elif renew_result is False:
-                log("续期失败")
-                status = "续期失败"
+            # 发现所有服务(Shared Hosting / Bot Hosting / ...), SERVICE_URL 可固定单个
+            if SERVICE_URL:
+                stype = "Shared Hosting" if "/hosting/" in SERVICE_URL else (
+                    "Bot Hosting" if "/bots/" in SERVICE_URL else "Service")
+                services = [{"type": stype, "url": SERVICE_URL}]
+                log(f"使用固定服务: {SERVICE_URL}")
             else:
-                # 续期后面板的到期时间可能有后台同步延迟，多次轮询读取
-                new_due = old_due
-                for i in range(6):
-                    try:
-                        page.reload(wait_until="domcontentloaded", timeout=60000)
-                        handle_cloudflare(page)
-                        time.sleep(3)
-                    except Exception:
-                        pass
-                    new_due = get_due_date(page, service_url)
-                    if new_due != old_due:
-                        break
-                    if i < 5:
-                        log("到期时间尚未刷新，5 秒后重试...")
-                        time.sleep(5)
-                log(f"续期后到期时间: {new_due}")
-                status = "续期成功"
-
-            send_telegram_notification(status, old_due, new_due, current_ip)
-
-            if renew_result is False:
+                services = discover_services(page)
+            if not services:
+                log("未发现任何服务，退出")
                 sys.exit(1)
-            sys.exit(0)
+
+            results = []
+            for svc in services:
+                result, old_due, new_due = renew_service(page, svc)
+                results.append((svc, result, old_due, new_due))
+
+            # 汇总
+            lines = []
+            has_fail = False
+            for svc, result, old_due, new_due in results:
+                if result == "NOT_TIME":
+                    s = "未到续期时间"
+                elif result is True:
+                    s = "续期成功"
+                else:
+                    s = "续期失败"
+                    has_fail = True
+                line = f"• {svc['type']}: {s}（{old_due} -> {new_due}）"
+                lines.append(line)
+                log(line)
+            send_telegram_notification("\n".join(lines), current_ip)
+
+            sys.exit(1 if has_fail else 0)
         except Exception as e:
             log(f"运行出错: {e}")
             sys.exit(1)

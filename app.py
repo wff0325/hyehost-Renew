@@ -1,6 +1,33 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+HYEHOST 共享主机/Bot Hosting(免费计划)自动续期脚本
+参考项目: https://github.com/wff0325/yincangyun (HidenCloud 续期)
 
+支持多服务类型自动续期: 登录后自动发现 Shared Hosting(/hosting) 和
+Bot Hosting(/bots) 下的所有服务, 逐个读取到期时间并续期。
+新增服务类型只需在 SERVICE_TYPES 列表加一项(列表页路径/链接正则/续期按钮文本)。
+
+用法:
+    本地运行(凭证放 .env 文件，已在 .gitignore 中，不会提交):
+        在 .env 中写入 EMAIL/PASSWORD，然后 python app.py
+    GitHub Actions:
+        仓库 Settings -> Secrets and variables -> Actions 添加 Secrets:
+        EMAIL(必填) PASSWORD(必填) TG_BOT_TOKEN(可选) TG_CHAT_ID(可选) NODE_LINK(可选代理)
+
+配置项(环境变量):
+    EMAIL          登录邮箱            (必填; .env 或 GitHub Secrets)
+    PASSWORD       登录密码            (必填; .env 或 GitHub Secrets)
+    SERVICE_URL    服务详情页完整URL    (可选, 留空则自动发现所有类型的所有服务)
+    TG_BOT_TOKEN   Telegram Bot Token  (可选, 通知)
+    TG_CHAT_ID     Telegram Chat ID    (可选, 通知)
+    NODE_LINK      代理节点分享链接      (可选; 由 workflow 的 sing-box 步骤消费,
+                   支持 vless:// vmess:// trojan:// tuic:// anytls:// hysteria2:// socks5:// socks://)
+    IS_PROXY       是否使用代理         (默认 false; workflow 代理步骤自动写入)
+    PROXY_SERVER   代理地址            (默认 http://127.0.0.1:1081)
+    BROWSER_CHANNEL 浏览器通道          (默认自动: msedge -> chrome -> 内置chromium)
+    SECURITY_TIMEOUT 安全验证总等待秒数 (默认 240)
+"""
 
 import os, re, sys, time, json, random, shutil
 
@@ -98,33 +125,104 @@ def get_current_ip(proxy_server=None):
         log(f"获取出口IP失败: {e}")
         return "获取失败"
 
-def send_telegram_notification(summary, current_ip="未知"):
-    """发送 Telegram 通知(汇总多服务续期结果)"""
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        log("Telegram 未配置，跳过通知")
-        return
-    local_time = time.gmtime(time.time() + 8 * 3600)
-    now = time.strftime("%Y-%m-%d %H:%M:%S", local_time)
+def _fmt_due(s):
+    """DD/MM/YYYY 或 YYYY-MM-DD -> 2026年11月23日"""
+    if not s or s == "未知":
+        return "未知"
+    try:
+        if re.match(r'^\d{4}-\d{2}-\d{2}$', s):
+            dt = time.strptime(s, "%Y-%m-%d")
+        elif re.match(r'^\d{1,2}/\d{1,2}/\d{4}$', s):
+            dt = time.strptime(s, "%d/%m/%Y")
+        else:
+            return s
+        return f"{dt.tm_year}年{dt.tm_mon:02d}月{dt.tm_mday:02d}日"
+    except Exception:
+        return s
+
+def _days_left(s):
+    if not s or s == "未知":
+        return None
+    try:
+        if re.match(r'^\d{4}-\d{2}-\d{2}$', s):
+            ts = time.mktime(time.strptime(s, "%Y-%m-%d"))
+        elif re.match(r'^\d{1,2}/\d{1,2}/\d{4}$', s):
+            ts = time.mktime(time.strptime(s, "%d/%m/%Y"))
+        else:
+            return None
+        return int(round((ts - time.time()) / 86400))
+    except Exception:
+        return None
+
+def _status_icon(result):
+    if result == "NOT_TIME":
+        return "🕐", "未到续期时间"
+    if result is True:
+        return "✅", "续期成功"
+    return "❌", "续期失败"
+
+def build_notification_text(results, current_ip="未知"):
+    """构造 HTML 通知文本。results: [(svc, result, old_due, new_due)]"""
+    now = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() + 8 * 3600))
     if '@' in EMAIL:
         name, domain = EMAIL.split('@', 1)
         masked = f"{name[:2]}****{name[-2:]}@{domain}" if len(name) > 4 else f"{name}@{domain}"
     else:
-        masked = EMAIL[:2] + '****'
-    text = (
-        f"HYEHOST 续期通知\n\n"
-        f"{summary}\n"
-        f"账号: {masked}\n"
-        f"续期使用IP: {current_ip}\n"
-        f"续期时间：{now}"
-    )
-    url = f"https://gh.opb.dpdns.org/https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+        masked = (EMAIL[:2] + '****') if EMAIL else "未配置"
+
+    icons = [_status_icon(r[1])[0] for r in results]
+    if any(r[1] is False for r in results):
+        head_icon, head = "⚠️", "HYEHOST 续期报告（有失败）"
+    elif all(r[1] == "NOT_TIME" for r in results):
+        head_icon, head = "🕐", "HYEHOST 续期检查"
+    else:
+        head_icon, head = "✅", "HYEHOST 续期报告"
+
+    lines = [
+        f"<b>{head_icon} {head}</b>",
+        "━━━━━━━━━━━━━━━━━━",
+        f"<b>账号</b>　<code>{masked}</code>",
+        "",
+    ]
+    for (svc, result, old_due, new_due) in results:
+        icon, label = _status_icon(result)
+        lines.append(f"<b>📦 {svc['type']}</b>")
+        lines.append(f"　{icon} {label}")
+        left = _days_left(new_due)
+        left_txt = f"（剩 {left} 天）" if left is not None else ""
+        if result is True and old_due != new_due:
+            lines.append(f"　{_fmt_due(old_due)} → <b>{_fmt_due(new_due)}</b>{left_txt}")
+        else:
+            lines.append(f"　到期 {_fmt_due(new_due)}{left_txt}")
+        lines.append("")
+    lines += [
+        "━━━━━━━━━━━━━━━━━━",
+        f"<b>🌐 出口 IP</b>　<code>{current_ip}</code>",
+        f"<b>🕒 时间</b>　{now} (UTC+8)",
+    ]
+    return "\n".join(lines)
+
+def send_telegram_notification(results, current_ip="未知"):
+    """发送排版精美的 Telegram 通知(HTML)。results: [(svc, result, old_due, new_due)]"""
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        log("Telegram 未配置，跳过通知")
+        return False
+    text = build_notification_text(results, current_ip)
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     try:
-        resp = requests.post(url, json={"chat_id": TG_CHAT_ID, "text": text},
+        resp = requests.post(url, json={"chat_id": TG_CHAT_ID, "text": text,
+                                        "parse_mode": "HTML",
+                                        "disable_web_page_preview": True},
                              timeout=10, proxies=REQUESTS_PROXIES)
         if resp.status_code == 200:
             log("Telegram 通知发送成功")
             return True
-        log(f"Telegram 通知失败: {resp.text}")
+        log(f"Telegram HTML 通知失败({resp.status_code})，回退纯文本: {resp.text[:120]}")
+        plain = re.sub(r'<[^>]+>', '', text)
+        r2 = requests.post(url, json={"chat_id": TG_CHAT_ID, "text": plain},
+                           timeout=10, proxies=REQUESTS_PROXIES)
+        log("Telegram 通知发送成功(纯文本)" if r2.status_code == 200
+            else f"Telegram 通知失败: {r2.text[:200]}")
     except Exception as e:
         log(f"Telegram 通知异常: {e}")
 
@@ -266,17 +364,38 @@ def handle_cloudflare(page, timeout=None):
     log("验证超时")
     return False
 
+def _captcha_pending(page):
+    """页面存在 Turnstile 占位节点但没有 token -> 验证尚未完成(可能是组件未渲染)"""
+    try:
+        return page.evaluate("""() => {
+            const hasWidget = !!document.querySelector(
+                '[id*="cf-chl-widget"], .cf-turnstile, #cf-turnstile, input[name="cf-turnstile-response"]');
+            const inp = document.querySelector('input[name="cf-turnstile-response"]');
+            const hasToken = !!(inp && inp.value && inp.value.length > 30);
+            return hasWidget && !hasToken;
+        }""")
+    except Exception:
+        return False
+
 def solve_turnstile(page, timeout=90):
     """处理页面上的 Turnstile 组件（如登录表单内嵌），通过后返回 True"""
     if _get_turnstile_token(page):
         return True
     frames = _find_visible_cf_frames(page)
     if not frames:
-        time.sleep(2)
-        if _get_turnstile_token(page):
-            return True
-        if not _find_visible_cf_frames(page):
-            return True  # 无 Turnstile
+        # 组件可能仍在加载: 最多再等 ~15 秒
+        for _ in range(10):
+            time.sleep(1.5)
+            if _get_turnstile_token(page):
+                return True
+            frames = _find_visible_cf_frames(page)
+            if frames:
+                break
+        if not frames:
+            if _captcha_pending(page):
+                log("⚠️ Turnstile 占位存在但未渲染（CF 资源可能被网络拦截），不提交表单")
+                return False
+            return True  # 页面确实无 Turnstile
     log("处理 Turnstile 人机验证...")
     start = time.time()
     last_click = 0
@@ -628,20 +747,13 @@ def main():
                 results.append((svc, result, old_due, new_due))
 
             # 汇总
-            lines = []
             has_fail = False
             for svc, result, old_due, new_due in results:
-                if result == "NOT_TIME":
-                    s = "未到续期时间"
-                elif result is True:
-                    s = "续期成功"
-                else:
-                    s = "续期失败"
+                icon, label = _status_icon(result)
+                if result is False:
                     has_fail = True
-                line = f"• {svc['type']}: {s}（{old_due} -> {new_due}）"
-                lines.append(line)
-                log(line)
-            send_telegram_notification("\n".join(lines), current_ip)
+                log(f"{icon} {svc['type']}: {label}（{old_due} -> {new_due}）")
+            send_telegram_notification(results, current_ip)
 
             sys.exit(1 if has_fail else 0)
         except Exception as e:
